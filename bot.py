@@ -3,66 +3,53 @@ import requests
 import yfinance as yf
 import pandas as pd
 import ccxt
-import math
 from datetime import datetime
 
-# --- 設定你的 Telegram 參數 ---
-# 如果是 GitHub Actions 自動化，會從環境變數讀取
-TG_TOKEN = os.environ.get('TG_TOKEN', "你的_TOKEN_測試用") 
-TG_CHAT_ID = os.environ.get('TG_CHAT_ID', "你的_CHAT_ID_測試用")
+# --- 設定 Telegram 參數 (從環境變數讀取) ---
+TG_TOKEN = os.environ.get('TG_TOKEN')
+TG_CHAT_ID = os.environ.get('TG_CHAT_ID')
 
 def get_data():
-    # 1. 抓取宏觀數據
     print("正在抓取數據...")
-    tickers = ["^VIX", "^VVIX", "BTC-USD"]
     
-    # 下載數據
+    # 1. 抓取 Yahoo 數據 (新增 DXY 美元指數)
+    tickers = ["^VIX", "^VVIX", "BTC-USD", "DX-Y.NYB"]
+    
     try:
         data = yf.download(tickers, period="5d", progress=False)
     except Exception as e:
-        print(f"下載失敗: {e}")
-        return None, None, None, 0.0
+        print(f"Yahoo 下載失敗: {e}")
+        return None
 
-    # 輔助函數：安全提取數據序列 (去除空值)
-    def get_clean_last_val(ticker):
+    # 輔助函數：安全提取數據
+    def get_last_val(ticker):
         try:
-            # 處理 yfinance 的多層索引或單層索引
             if 'Close' in data.columns:
                 df = data['Close']
             else:
                 df = data
-
-            if isinstance(df, pd.DataFrame) and ticker in df.columns:
-                series = df[ticker]
-            else:
-                # 如果只有一個 ticker，可能沒有 ticker 欄位
-                series = df.iloc[:, 0] if ticker == tickers[0] else df
-
-            # 關鍵修復：移除空值 (NaN)，只取最後一筆「有效」數字
+            
+            series = df[ticker] if ticker in df.columns else df.iloc[:, 0]
             valid_series = series.dropna()
-            
-            if valid_series.empty:
-                return 0.0
-            
-            return float(valid_series.iloc[-1])
-        except Exception as e:
-            print(f"數據解析錯誤 ({ticker}): {e}")
+            return float(valid_series.iloc[-1]) if not valid_series.empty else 0.0
+        except:
             return 0.0
 
-    # 獲取最新有效值
-    cur_vix = get_clean_last_val("^VIX")
-    cur_vvix = get_clean_last_val("^VVIX")
-    cur_btc = get_clean_last_val("BTC-USD")
-    
-    # 為了計算 Mayer Multiple，我們需要 BTC 的歷史序列
+    cur_vix = get_last_val("^VIX")
+    cur_vvix = get_last_val("^VVIX")
+    cur_btc = get_last_val("BTC-USD")
+    cur_dxy = get_last_val("DX-Y.NYB") # 美元指數
+
+    # 2. 計算 Mayer Multiple
     try:
         btc_hist = yf.download("BTC-USD", period="1y", progress=False)['Close']
         if isinstance(btc_hist, pd.DataFrame): btc_hist = btc_hist.iloc[:, 0]
         ma200 = float(btc_hist.rolling(window=200).mean().iloc[-1])
+        mayer = cur_btc / ma200 if ma200 > 0 else 0
     except:
-        ma200 = cur_btc # 防止報錯，暫時設為現價
+        mayer = 0
 
-    # 2. 抓取幣安數據
+    # 3. 抓取幣安數據 (資金費率)
     binance = ccxt.binance()
     try:
         funding = binance.fapiPublic_get_premiumindex({'symbol': 'BTCUSDT'})
@@ -70,70 +57,94 @@ def get_data():
     except:
         fr = 0.0
 
-    return cur_vix, cur_vvix, cur_btc, ma200, fr
+    # 4. 抓取 恐慌貪婪指數 (Alternative.me API)
+    fng_val = 50 # 預設中性
+    fng_text = "Neutral"
+    try:
+        fng_resp = requests.get("https://api.alternative.me/fng/").json()
+        fng_data = fng_resp['data'][0]
+        fng_val = int(fng_data['value'])
+        fng_text = fng_data['value_classification']
+    except:
+        pass
+
+    return {
+        "vix": cur_vix, "vvix": cur_vvix, "btc": cur_btc, 
+        "dxy": cur_dxy, "mayer": mayer, "fr": fr,
+        "fng_val": fng_val, "fng_text": fng_text
+    }
 
 def analyze_and_send():
-    cur_vix, cur_vvix, cur_btc, ma200, fr = get_data()
-    
-    # 計算 Mayer Multiple
-    mayer = cur_btc / ma200 if ma200 > 0 else 0
-    
-    # --- 生成報告內容 ---
-    date_str = datetime.now().strftime("%Y-%m-%d")
-    
-    # 判斷信號
-    signal_text = "⚖️ **震盪觀望**"
-    if cur_vix > 30 and mayer < 0.8:
-        signal_text = "🚀 **鑽石買點 (雙重共振)**\n建議：大資金分批進場"
-    elif mayer > 0 and mayer < 0.8: # 確保不是0
-        signal_text = "💎 **價值低估 (Mayer < 0.8)**\n建議：開啟定投"
-    elif cur_vix > 30:
-        signal_text = "🔥 **宏觀恐慌 (VIX > 30)**\n建議：左側接刀"
-    elif mayer > 2.4:
-        signal_text = "🔴 **頂部風險 (Mayer > 2.4)**\n建議：分批止盈"
-    elif fr < -0.01:
-        signal_text = "⚡ **軋空機會 (費率負值)**\n建議：短線做多"
+    d = get_data()
+    if not d: return
 
-    # 組合訊息
-    message = f"""
-📊 **宏觀日報** ({date_str})
----------------------------
-**{signal_text}**
----------------------------
-**1. 宏觀恐慌指標**
-• VIX (恐慌): `{cur_vix:.2f}` (警戒: 30)
-• VVIX (波動): `{cur_vvix:.2f}` (警戒: 110)
+    # --- 智能策略判讀 ---
+    # 預設狀態
+    signal = "⚖️ **震盪觀望**"
+    action = "網格交易 / 觀望"
 
-**2. 比特幣價值錨**
-• 現價: `${cur_btc:,.0f}`
-• 估值 (Mayer): `{mayer:.2f}`
-  *(<0.8 抄底 / >2.4 逃頂)*
+    # 判斷邏輯
+    # 1. 鑽石底：估值便宜 + 市場恐慌
+    if d['mayer'] < 0.8 and d['vix'] > 30:
+        signal = "🚀 **鑽石買點 (Diamond Buy)**"
+        action = "大資金分批抄底 (勝率極高)"
+    
+    # 2. 黃金坑：估值便宜 (但市場不一定恐慌，適合定投)
+    elif d['mayer'] < 0.8:
+        signal = "💎 **價值低估區 (Deep Value)**"
+        action = "開啟定投 / 囤幣模式"
+    
+    # 3. 恐慌拋售：VIX 炸裂 (可能有更低點，但也適合左側)
+    elif d['vix'] > 30:
+        signal = "🔥 **恐慌拋售 (Panic Sell)**"
+        action = "分批接刀 (注意 DXY 是否過高)"
+    
+    # 4. 短線機會：資金費率負值 (軋空)
+    elif d['fr'] < -0.01:
+        signal = "⚡ **短線軋空 (Squeeze)**"
+        action = "短線做多博反彈"
 
-**3. 短線情緒**
-• 資金費率: `{fr:.4f}%`
----------------------------
-_Generated by GitHub Actions_
+    # 5. 風險提示：頂部特徵
+    elif d['mayer'] > 2.4:
+        signal = "🔴 **頂部風險 (Top Risk)**"
+        action = "分批止盈，切勿追高"
+
+    # --- 組合 Telegram 訊息 ---
+    msg = f"""
+📊 **Phyrex 宏觀狙擊日報**
+📅 {datetime.now().strftime("%Y-%m-%d")}
+-------------------------------
+**{signal}**
+💡 策略：{action}
+-------------------------------
+**1. 資金與宏觀 (Fuel)**
+• 美元指數 (DXY): `{d['dxy']:.2f}`
+  *(>105 壓制幣價 / <100 利好)*
+• VIX 恐慌指數: `{d['vix']:.2f}`
+  *(>30 恐慌 / <15 貪婪)*
+
+**2. 比特幣估值 (Value)**
+• 價格: `${d['btc']:,.0f}`
+• Mayer 倍數: `{d['mayer']:.2f}`
+  *(<0.8 抄底區 / >2.4 逃頂區)*
+
+**3. 市場情緒 (Sentiment)**
+• 恐慌貪婪指數: `{d['fng_val']}` ({d['fng_text']})
+• 資金費率: `{d['fr']:.4f}%`
+-------------------------------
+_Powered by GitHub Actions_
 """
-    
-    # 發送請求
+
+    # 發送
     if TG_TOKEN and TG_CHAT_ID:
         url = f"https://api.telegram.org/bot{TG_TOKEN}/sendMessage"
-        payload = {
-            "chat_id": TG_CHAT_ID,
-            "text": message,
-            "parse_mode": "Markdown"
-        }
-        
         try:
-            resp = requests.post(url, json=payload)
-            if resp.status_code == 200:
-                print("✅ 訊息發送成功！")
-            else:
-                print(f"❌ 發送失敗: {resp.text}")
+            requests.post(url, json={"chat_id": TG_CHAT_ID, "text": msg, "parse_mode": "Markdown"})
+            print("✅ 訊息發送成功")
         except Exception as e:
-            print(f"❌ 錯誤: {e}")
+            print(f"❌ 發送失敗: {e}")
     else:
-        print("❌ 找不到 Token 或 Chat ID")
+        print("❌ 請設定環境變數")
 
 if __name__ == "__main__":
     analyze_and_send()
